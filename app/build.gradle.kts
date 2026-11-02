@@ -11,7 +11,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.emptycastle.novery"
+        applicationId = "com.emptycastle.novery.test"
         minSdk = 26
         targetSdk = 36
         versionCode = 2
