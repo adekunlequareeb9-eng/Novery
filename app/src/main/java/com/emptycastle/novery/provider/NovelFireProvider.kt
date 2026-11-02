@@ -19,12 +19,12 @@ import java.util.concurrent.ConcurrentHashMap
 
 
 /**
- * Provider for NovelFire.net
+ * Provider for NovelPhoenix (formerly NovelFire).
  */
 class NovelFireProvider : MainProvider() {
 
     override val name = "NovelFire"
-    override val mainUrl = "https://novelfire.net"
+    override val mainUrl = "https://novelphoenix.com"
     override val hasMainPage = true
     override val hasReviews = true
     override val iconRes: Int = R.drawable.ic_provider_novelfire
@@ -282,10 +282,12 @@ class NovelFireProvider : MainProvider() {
      */
     private fun extractNovelSlug(url: String): String {
         val cleaned = url
+            .substringBefore("?")
             .replace(mainUrl, "")
             .replace("$mainUrl/", "")
             .removePrefix("/")
             .removePrefix("book/")
+            .removePrefix("novel/")
             .removeSuffix("/")
             .split("/")
             .firstOrNull() ?: url
@@ -911,7 +913,7 @@ class NovelFireProvider : MainProvider() {
                     "Chapter $nSort"
                 }
 
-                val chapterPath = "book/$novelSlug/chapter-$nSort"
+                val chapterPath = "novel/$novelSlug/chapter-$nSort"
                 val chapterUrl = fixUrl(chapterPath) ?: continue
 
                 chapters.add(
@@ -943,44 +945,50 @@ class NovelFireProvider : MainProvider() {
     private suspend fun loadChaptersFromHtml(novelSlug: String): List<Chapter> {
         try {
             // Step 1: Load first page to check pagination
-            val firstPageUrl = "$mainUrl/book/$novelSlug/chapters"
+            val firstPageUrl = "$mainUrl/novel/$novelSlug/chapters"
             val firstPageDoc = get(firstPageUrl).document
 
-            // Step 2: Check if pagination exists
-            val pagination = firstPageDoc.selectFirst("div.pagenav div.pagination-container nav ul.pagination")
+            // NovelPhoenix uses a select menu for chapter-range pagination.
+            // Keep support for the older numbered-list pagination as a fallback.
+            val rangeOptions = firstPageDoc.select("[aria-label='Chapter range'] > option")
+            val lastPageValue = rangeOptions.lastOrNull()?.attr("value")
 
-            if (pagination != null) {
-                // Find the last page number
-                val pageItems = pagination.select("li")
-                // Second-to-last item is usually the last page number (last item is "next" arrow)
-                val lastPageElement = pageItems.getOrNull(pageItems.size - 2)
-                val lastPageNumber = lastPageElement?.text()?.toIntOrNull() ?: 1
+            val legacyPagination = firstPageDoc.selectFirst(
+                "div.pagenav div.pagination-container nav ul.pagination"
+            )
+            val legacyLastPage = legacyPagination?.select("li")
+                ?.getOrNull((legacyPagination.select("li").size - 2).coerceAtLeast(0))
+                ?.text()?.toIntOrNull()
 
-                if (lastPageNumber > 1) {
-                    // Step 3: Load ONLY the last page to get total chapter count
-                    val lastPageUrl = "$mainUrl/book/$novelSlug/chapters?page=$lastPageNumber"
-                    val lastPageDoc = get(lastPageUrl).document
+            val lastPageUrl = when {
+                !lastPageValue.isNullOrBlank() -> {
+                    if (lastPageValue.startsWith("http")) lastPageValue
+                    else fixUrl(lastPageValue)
+                }
+                legacyLastPage != null && legacyLastPage > 1 ->
+                    "$mainUrl/novel/$novelSlug/chapters?page=$legacyLastPage"
+                else -> null
+            }
 
-                    // Find the last chapter link
-                    val lastChapterLink = lastPageDoc.select("ul.chapter-list li a")
-                        .lastOrNull()?.attr("href") ?: ""
+            if (lastPageUrl != null) {
+                // Load the final chapter-list page to discover the highest chapter number.
+                val lastPageDoc = get(lastPageUrl).document
+                val lastChapterLink = lastPageDoc.select("ul.chapter-list li a")
+                    .lastOrNull()?.attr("href") ?: ""
 
-                    // Extract chapter number from URL (e.g., "/book/slug/chapter-2534")
-                    val totalChapters = Regex("chapter-(\\d+)").find(lastChapterLink)
-                        ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                val totalChapters = Regex("chapter-(\\d+)").find(lastChapterLink)
+                    ?.groupValues?.getOrNull(1)?.toIntOrNull()
 
-                    if (totalChapters != null && totalChapters > 0) {
-                        // Step 4: Generate all chapters without making more requests!
-                        return (1..totalChapters).map { chapterNumber ->
-                            val chapterUrl = fixUrl("book/$novelSlug/chapter-$chapterNumber")
-                                ?: "$mainUrl/book/$novelSlug/chapter-$chapterNumber"
+                if (totalChapters != null && totalChapters > 0) {
+                    return (1..totalChapters).map { chapterNumber ->
+                        val chapterUrl = fixUrl("novel/$novelSlug/chapter-$chapterNumber")
+                            ?: "$mainUrl/novel/$novelSlug/chapter-$chapterNumber"
 
-                            Chapter(
-                                name = "Chapter $chapterNumber",
-                                url = chapterUrl,
-                                dateOfRelease = null
-                            )
-                        }
+                        Chapter(
+                            name = "Chapter $chapterNumber",
+                            url = chapterUrl,
+                            dateOfRelease = null
+                        )
                     }
                 }
             }
