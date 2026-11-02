@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'fix/novelphoenix-provider']
   pull_request:
     branches: [main]
 
