@@ -6,6 +6,7 @@ import com.emptycastle.novery.domain.model.FilterOption
 import com.emptycastle.novery.domain.model.MainPageResult
 import com.emptycastle.novery.domain.model.Novel
 import com.emptycastle.novery.domain.model.NovelDetails
+import com.emptycastle.novery.data.remote.CloudflareManager
 import com.emptycastle.novery.domain.model.UserReview
 import com.emptycastle.novery.util.HtmlUtils
 import com.emptycastle.novery.util.RatingUtils
@@ -15,6 +16,9 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
 
 
@@ -28,6 +32,73 @@ class NovelFireProvider : MainProvider() {
     override val hasMainPage = true
     override val hasReviews = true
     override val iconRes: Int = R.drawable.ic_provider_novelfire
+
+    override val rateLimitTime: Long = 600L
+
+    // Serialises request pacing so parallel callers can't burst the site.
+    private val throttleMutex = Mutex()
+    private var lastRequestAt = 0L
+
+    /**
+     * Rewrites old NovelFire links (saved in libraries/downloads) to the
+     * current NovelPhoenix layout: https://novelfire.net/book/x -> https://novelphoenix.com/novel/x
+     */
+    private fun normalizeUrl(url: String): String {
+        var u = url.trim()
+        u = u.replace(Regex("^https?://(www\\.)?novelfire\\.(net|com)", RegexOption.IGNORE_CASE), mainUrl)
+        u = u.replace("$mainUrl/book/", "$mainUrl/novel/")
+        if (u.startsWith("book/")) u = "novel/" + u.removePrefix("book/")
+        if (u.startsWith("/book/")) u = "/novel/" + u.removePrefix("/book/")
+        return u
+    }
+
+    /**
+     * GET with pacing, challenge/429/5xx detection and exponential backoff.
+     * Throws (message contains "timeout"/"429"/"503" so the downloader retries)
+     * instead of returning a challenge page that looks like an empty chapter.
+     */
+    private suspend fun guardedGet(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        attempts: Int = 4
+    ): com.emptycastle.novery.data.remote.NetworkClient.NetworkResponse {
+        var lastProblem = "unknown"
+        for (attempt in 0 until attempts) {
+            throttleMutex.withLock {
+                val wait = rateLimitTime - (System.currentTimeMillis() - lastRequestAt)
+                if (wait > 0) delay(wait)
+                lastRequestAt = System.currentTimeMillis()
+            }
+
+            val response = try {
+                get(url, headers)
+            } catch (e: Exception) {
+                lastProblem = e.message ?: "network error"
+                delay(1500L * (attempt + 1))
+                continue
+            }
+
+            val body = response.text
+            val limited = response.code == 429 ||
+                body.contains("You are being rate limited", ignoreCase = true) ||
+                body.contains("Too Many Requests", ignoreCase = true)
+            val challenged = response.isCloudflareBlocked ||
+                response.document.title().contains("Just a moment", ignoreCase = true) ||
+                (response.code in listOf(403, 503) && CloudflareManager.isCloudflareChallengeHtml(body))
+            val serverError = response.code in 500..599
+
+            if (!limited && !challenged && !serverError) return response
+
+            lastProblem = when {
+                limited -> "HTTP 429 rate limited"
+                challenged -> "Cloudflare challenge (open the source in the in-app browser once to refresh access)"
+                else -> "HTTP ${response.code} 503 server error"
+            }
+            // Longer back-off when the site is actively pushing back.
+            delay((if (limited) 8000L else 3000L) * (attempt + 1))
+        }
+        throw java.io.IOException("connection blocked: $lastProblem")
+    }
 
     // Thread-safe state for comment pagination and post ID caching
     private val commentCursors = ConcurrentHashMap<String, String?>()
@@ -573,7 +644,7 @@ class NovelFireProvider : MainProvider() {
             if (avatarUrl.contains("default-avatar") || avatarUrl.contains("data:image")) {
                 avatarUrl = null
             } else if (!avatarUrl.startsWith("http")) {
-                avatarUrl = "https://images.novelfire.net$avatarUrl"
+                avatarUrl = "$mainUrl$avatarUrl"
             }
         }
 
@@ -743,11 +814,12 @@ class NovelFireProvider : MainProvider() {
     // ================================================================
 
     override suspend fun load(url: String): NovelDetails? {
-        val novelPath = deSlash(url.replace(mainUrl, "").replace("$mainUrl/", ""))
+        val normalizedUrl = normalizeUrl(url)
+        val novelPath = deSlash(normalizedUrl.replace(mainUrl, "").replace("$mainUrl/", ""))
         val novelSlug = extractNovelSlug(novelPath)
-        val fullUrl = if (url.startsWith("http")) url else "$mainUrl/$novelPath"
+        val fullUrl = if (normalizedUrl.startsWith("http")) normalizedUrl else "$mainUrl/$novelPath"
 
-        val response = get(fullUrl)
+        val response = guardedGet(fullUrl)
         val document = response.document
 
         if (document.title().contains("Cloudflare", ignoreCase = true)) {
@@ -946,7 +1018,7 @@ class NovelFireProvider : MainProvider() {
         try {
             // Step 1: Load first page to check pagination
             val firstPageUrl = "$mainUrl/novel/$novelSlug/chapters"
-            val firstPageDoc = get(firstPageUrl).document
+            val firstPageDoc = guardedGet(firstPageUrl).document
 
             // NovelPhoenix uses a select menu for chapter-range pagination.
             // Keep support for the older numbered-list pagination as a fallback.
@@ -972,7 +1044,7 @@ class NovelFireProvider : MainProvider() {
 
             if (lastPageUrl != null) {
                 // Load the final chapter-list page to discover the highest chapter number.
-                val lastPageDoc = get(lastPageUrl).document
+                val lastPageDoc = guardedGet(lastPageUrl).document
                 val lastChapterLink = lastPageDoc.select("ul.chapter-list li a")
                     .lastOrNull()?.attr("href") ?: ""
 
@@ -1079,9 +1151,10 @@ class NovelFireProvider : MainProvider() {
     // ================================================================
 
     override suspend fun loadChapterContent(url: String): String? {
-        val fullUrl = if (url.startsWith("http")) url else "$mainUrl/$url"
+        val normalized = normalizeUrl(url)
+        val fullUrl = if (normalized.startsWith("http")) normalized else "$mainUrl/${normalized.removePrefix("/")}"
 
-        val response = get(fullUrl)
+        val response = guardedGet(fullUrl)
         val document = response.document
 
         if (document.title().contains("Cloudflare", ignoreCase = true)) {
