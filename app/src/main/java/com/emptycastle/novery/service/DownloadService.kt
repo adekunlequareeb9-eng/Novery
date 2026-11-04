@@ -796,6 +796,53 @@ class DownloadService : Service() {
                     delay(getAdaptiveDelay(failedCount))
                 }
 
+                // Second pass: failures are usually temporary (rate limit / Cloudflare),
+                // so cool down and retry them once before reporting.
+                if (failedChapters.isNotEmpty() && isActive && !_downloadState.value.isPaused) {
+                    updateProgress(
+                        chapterName = "Cooling down before retrying ${failedChapters.size} failed chapters...",
+                        progress = request.chapterUrls.size,
+                        successCount = successCount,
+                        failedCount = failedCount,
+                        skippedCount = skippedCount,
+                        bytesDownloaded = totalBytes,
+                        isProcessing = false
+                    )
+                    delay(20_000L)
+
+                    val toRetry = failedChapters.toList()
+                    failedChapters.clear()
+                    for ((idx, retryUrl) in toRetry) {
+                        if (!isActive || _downloadState.value.isPaused) break
+                        val retryName = request.chapterNames.getOrNull(idx) ?: "Chapter ${idx + 1}"
+                        val retryResult = downloadChapterWithRetry(
+                            chapterUrl = retryUrl,
+                            chapterName = retryName,
+                            novelUrl = request.novelUrl,
+                            provider = provider,
+                            maxRetries = 3
+                        )
+                        when (retryResult) {
+                            is ChapterDownloadResult.Success -> {
+                                failedCount--
+                                successCount++
+                                totalBytes += retryResult.bytesDownloaded
+                            }
+                            else -> failedChapters.add(idx to retryUrl)
+                        }
+                        updateProgress(
+                            chapterName = retryName,
+                            progress = request.chapterUrls.size,
+                            successCount = successCount,
+                            failedCount = failedCount,
+                            skippedCount = skippedCount,
+                            bytesDownloaded = totalBytes,
+                            isProcessing = false
+                        )
+                        delay(1000L)
+                    }
+                }
+
                 // Download complete
                 onDownloadComplete(
                     DownloadResult(
@@ -894,16 +941,19 @@ class DownloadService : Service() {
             message.contains("reset") -> true
             message.contains("429") -> true
             message.contains("503") -> true
+            message.contains("blocked") -> true
+            message.contains("rate limit") -> true
+            message.contains("cloudflare") -> true
             else -> false
         }
     }
 
     private fun getAdaptiveDelay(failedCount: Int): Long {
         return when {
-            failedCount > 10 -> 1000L
-            failedCount > 5 -> 500L
-            failedCount > 2 -> 350L
-            else -> 200L
+            failedCount > 10 -> 2500L
+            failedCount > 5 -> 1500L
+            failedCount > 2 -> 800L
+            else -> 400L
         }
     }
 
